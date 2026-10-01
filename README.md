@@ -2,7 +2,7 @@
 
 クリスタルノジョさんを海に投げて、水切りでどこまで飛ばせるかを競うブラウザゲームです。
 
-## ▶ [ここから遊べます](https://YOUR_NAME.github.io/nojo-skip/)
+## ▶ [ここから遊べます](https://seibutu-h.github.io/nojo-skip/)
 
 PC・スマホのブラウザで、そのまま遊べます（インストール不要）。
 
