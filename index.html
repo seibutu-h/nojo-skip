@@ -2526,15 +2526,56 @@ const Rank = (() => {
     $r('rkMsg').textContent = '保存しました';
     try { const r = await post({ action: 'rename' }); if (r.ok && r.name !== name && name) $r('rkMsg').textContent = 'その名前は使えないため「' + r.name + '」になりました'; } catch (err) {}
   });
+  // 送信に失敗した記録は、ブラウザに一時保存して、あとで送り直す
+  const QKEY = 'nojo-rank-queue';
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  function qLoad() {
+    try {
+      const a = JSON.parse(localStorage.getItem(QKEY) || '[]');
+      const old = Date.now() - 14 * 86400000;
+      return Array.isArray(a) ? a.filter(x => x && typeof x.dist === 'number' && Array.isArray(x.ev) && (x.t || 0) > old) : [];
+    } catch (e) { return []; }
+  }
+  function qSave(a) { try { localStorage.setItem(QKEY, JSON.stringify(a.slice(-30))); } catch (e) {} }
+  function enqueue(item) { const q = qLoad(); q.push(Object.assign({ t: Date.now() }, item)); qSave(q); }
+  let flushing = false, retryDelay = 6000, retryTimer = null;
+  function schedule(ms) { clearTimeout(retryTimer); retryTimer = setTimeout(flush, ms); }
+  const isFinal = err => /^(invalid|bad_)/.test(String(err || ''));   // 送り直しても通らない記録
+  async function flush() {
+    if (flushing || !on) return;
+    flushing = true;
+    try {
+      let q = qLoad();
+      while (q.length) {
+        const it = q[0];
+        let res = null;
+        try { res = await post({ action: 'submit', dist: it.dist, skips: it.skips, ev: it.ev }); } catch (e) { res = null; }
+        if (res && res.ok) { q.shift(); qSave(q); last = res; retryDelay = 6000; await sleep(3500); }   // サーバーは同じ人の送信を3秒に1回に制限している
+        else if (res && isFinal(res.err)) { q.shift(); qSave(q); }
+        else { schedule(retryDelay); retryDelay = Math.min(retryDelay * 2, 120000); break; }
+        q = qLoad();
+      }
+    } finally { flushing = false; }
+  }
+  addEventListener('online', () => schedule(1500));
+  if (on) setTimeout(() => { if (qLoad().length) flush(); }, 4000);
+
   // 1投ごとに送信（結果画面に順位を出す）
   async function submit(dist, skips, ev) {
     if (!on) return;
     const el = $r('rRank');
     el.textContent = 'ランキングに送信中…';
+    const item = { dist: Math.round(dist * 10) / 10, skips, ev };
     try {
-      const res = await post({ action: 'submit', dist: Math.round(dist * 10) / 10, skips, ev });
-      if (!res.ok) { el.textContent = res.err === 'too_fast' ? '' : 'この記録は送信できませんでした'; return; }
+      const res = await post(Object.assign({ action: 'submit' }, item));
+      if (!res.ok) {
+        if (isFinal(res.err)) { el.textContent = 'この記録は送信できませんでした'; return; }
+        enqueue(item); schedule(res.err === 'too_fast' ? 4000 : retryDelay);
+        el.textContent = res.err === 'too_fast' ? '' : 'ランキングに送れませんでした。あとで自動で送り直します';
+        return;
+      }
       last = res;
+      if (qLoad().length) schedule(4000);   // 前に失敗した記録が残っていれば、続けて送る
       el.innerHTML = '';
       const parts = [['距離', res.dist.me], ['水切り', res.skips.me], ['プレイ回数', res.plays.me]];
       parts.forEach(([label, me], i) => {
@@ -2545,9 +2586,12 @@ const Rank = (() => {
       });
       if (res.newBest && res.newBest.dist && res.dist.me && res.dist.me[0] <= 3) el.append('　トップ3入り！');
       if (!name) { const n = document.createElement('div'); n.style.cssText = 'font-size:11px;font-weight:500;color:var(--ink-soft);margin-top:2px'; n.textContent = '名前は「ランキング」から決められます'; el.append(n); }
-    } catch (e) { el.textContent = 'ランキングに送信できませんでした'; }
+    } catch (e) {
+      enqueue(item); schedule(retryDelay);
+      el.textContent = 'ランキングに送れませんでした。あとで自動で送り直します';
+    }
   }
-  return { submit, open, get on() { return on; } };
+  return { submit, open, flush, get on() { return on; } };
 })();
 
 /* =========================================================
