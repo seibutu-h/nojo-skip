@@ -2043,6 +2043,7 @@ function finish() {
   if (Rank.on && rec) {
     const t0 = rec.frames.length ? rec.frames[0][0] : 0;
     const ev = rec.events.filter(e => e.type === 'skip').map(e => [Math.round((e.t - t0) * 100) / 100, Math.round(Math.hypot(e.x - LAUNCH.x, e.z - LAUNCH.z) * 10) / 10]);
+    Rank.recordRun(d, skips, ev);      // ベストの経過を残しておく（ランキングに届かなかったときの送り直し用）
     Rank.submit(d, skips, ev);
   }
   $('rS').textContent = '水切り ' + skips + '回';
@@ -2551,7 +2552,7 @@ const Rank = (() => {
         let res = null;
         try { res = await post({ action: 'submit', dist: it.dist, skips: it.skips, ev: it.ev }); } catch (e) { res = null; }
         if (res && res.ok) { q.shift(); qSave(q); last = res; retryDelay = 6000; await sleep(3500); }   // サーバーは同じ人の送信を3秒に1回に制限している
-        else if (res && isFinal(res.err)) { q.shift(); qSave(q); }
+        else if (res && isFinal(res.err)) { markBad(it); q.shift(); qSave(q); }
         else { schedule(retryDelay); retryDelay = Math.min(retryDelay * 2, 120000); break; }
         q = qLoad();
       }
@@ -2559,6 +2560,56 @@ const Rank = (() => {
   }
   addEventListener('online', () => schedule(1500));
   if (on) setTimeout(() => { if (qLoad().length) flush(); }, 4000);
+
+  // ベスト記録（距離が最大の1投・水切りが最多の1投）の経過を残しておき、ランキングより高ければ送る
+  const RKEY = 'nojo-best-runs', SKEY = 'nojo-best-skips';
+  function runsLoad() { try { const o = JSON.parse(localStorage.getItem(RKEY) || '{}'); return o && typeof o === 'object' ? o : {}; } catch (e) { return {}; } }
+  function runsSave(o) { try { localStorage.setItem(RKEY, JSON.stringify(o)); } catch (e) {} }
+  function recordRun(dist, skips, ev) {
+    const o = runsLoad(), r = { dist: Math.round(dist * 10) / 10, skips, ev };
+    if (!o.dist || r.dist > o.dist.dist) o.dist = r;
+    if (!o.skips || r.skips > o.skips.skips || (r.skips === o.skips.skips && r.dist > o.skips.dist)) o.skips = r;
+    runsSave(o);
+  }
+  function markBad(it) { const o = runsLoad(); for (const k of ['dist', 'skips']) if (o[k] && o[k].dist === it.dist && o[k].skips === it.skips) o[k].bad = true; runsSave(o); }
+  // 水切りの最多回数（手元の記録とランキングの記録のうち大きいほう）
+  function skipsBest(serverSkips) {
+    let s = 0; try { s = +localStorage.getItem(SKEY) || 0; } catch (e) {}
+    const o = runsLoad();
+    s = Math.max(s, o.skips ? o.skips.skips : 0, serverSkips || 0);
+    try { localStorage.setItem(SKEY, String(s)); } catch (e) {}
+    return s;
+  }
+  // 手元のベストがランキングより高ければ、保存してある経過ごと送る（送ったらtrue）
+  function syncBest(res) {
+    if (!res || !res.dist || !res.skips) return false;
+    const o = runsLoad(), sd = res.dist.me ? res.dist.me[2] : 0, ss = res.skips.me ? res.skips.me[2] : 0;
+    const q = qLoad(); let add = false;
+    const push = r => { if (r && !r.bad && Array.isArray(r.ev) && !q.some(x => x.dist === r.dist && x.skips === r.skips)) { q.push({ t: Date.now(), dist: r.dist, skips: r.skips, ev: r.ev }); add = true; } };
+    if (o.dist && o.dist.dist > sd + 0.04) push(o.dist);
+    if (o.skips && o.skips.skips > ss) push(o.skips);
+    if (add) { qSave(q); schedule(3500); }
+    return add;
+  }
+
+  // 救済送信：経過（ev）を残せていなかった時期のベストを、画面の表示どおりに1回だけ送る
+  const CKEY = 'nojo-claimed';
+  async function maybeClaim(res) {
+    try { if (localStorage.getItem(CKEY)) return false; } catch (e) { return false; }
+    if (!res || !res.dist || !res.skips) return false;
+    const sd = res.dist.me ? res.dist.me[2] : 0, ss = res.skips.me ? res.skips.me[2] : 0;
+    const o = runsLoad(), bs = Math.max(skipsBest(ss), best.s || 0);
+    const covD = o.dist && !o.dist.bad && o.dist.dist >= best.d - 0.05;      // 経過つきで送れる分は syncBest に任せる
+    const covS = o.skips && !o.skips.bad && o.skips.skips >= bs;
+    const needD = best.d > sd + 0.05 && !covD, needS = bs > ss && !covS;
+    if (!needD && !needS) { try { localStorage.setItem(CKEY, '1'); } catch (e) {} return false; }
+    try {
+      const r = await post({ action: 'claim', dist: Math.round(best.d * 10) / 10, skips: bs });
+      if (r && (r.ok || isFinal(r.err))) { try { localStorage.setItem(CKEY, '1'); } catch (e) {} }
+      if (r && r.ok) { last = r; return true; }
+    } catch (e) {}
+    return false;
+  }
 
   // 1投ごとに送信（結果画面に順位を出す）
   async function submit(dist, skips, ev) {
@@ -2569,7 +2620,7 @@ const Rank = (() => {
     try {
       const res = await post(Object.assign({ action: 'submit' }, item));
       if (!res.ok) {
-        if (isFinal(res.err)) { el.textContent = 'この記録は送信できませんでした'; return; }
+        if (isFinal(res.err)) { markBad(item); el.textContent = 'この記録は送信できませんでした'; return; }
         enqueue(item); schedule(res.err === 'too_fast' ? 4000 : retryDelay);
         el.textContent = res.err === 'too_fast' ? '' : 'ランキングに送れませんでした。あとで自動で送り直します';
         return;
@@ -2585,13 +2636,21 @@ const Rank = (() => {
         if (i < 2) el.append('　');
       });
       if (res.newBest && res.newBest.dist && res.dist.me && res.dist.me[0] <= 3) el.append('　トップ3入り！');
+      // 手元のベストと、ランキング上の記録を並べて見せる。ランキングより手元が高ければ、保存してある分を送る
+      const sd = res.dist.me ? res.dist.me[2] : 0, sb = skipsBest(res.skips.me ? res.skips.me[2] : 0);
+      const syncing = syncBest(res);
+      if (!syncing) maybeClaim(res).then(ok => { if (ok) { const t = $r('rRank'); const m = document.createElement('div'); m.style.cssText = 'font-size:11px;font-weight:500;color:var(--ink-soft);margin-top:2px'; m.textContent = 'これまでのベスト記録をランキングに反映しました'; t.append(m); } });
+      const bd = document.createElement('div');
+      bd.style.cssText = 'font-size:11px;font-weight:500;color:var(--ink-soft);margin-top:2px';
+      bd.textContent = 'ベスト ' + best.d.toFixed(1) + 'm ・ 水切り最多 ' + sb + '回' + (best.d > sd + 0.05 ? (syncing ? '（ランキングに送っています）' : '（ランキング上は ' + sd.toFixed(1) + 'm。これを超えると更新されます）') : '');
+      el.append(bd);
       if (!name) { const n = document.createElement('div'); n.style.cssText = 'font-size:11px;font-weight:500;color:var(--ink-soft);margin-top:2px'; n.textContent = '名前は「ランキング」から決められます'; el.append(n); }
     } catch (e) {
       enqueue(item); schedule(retryDelay);
       el.textContent = 'ランキングに送れませんでした。あとで自動で送り直します';
     }
   }
-  return { submit, open, flush, get on() { return on; } };
+  return { submit, open, flush, recordRun, get on() { return on; } };
 })();
 
 /* =========================================================
